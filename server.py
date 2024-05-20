@@ -29,62 +29,97 @@ signature_types = {}
 round_wins = {1: 0, 2: 0}
 lock = threading.Lock()
 
+
 def generate_unique_numbers():
     return random.sample(range(1, 16), 3)
+
+
+def reliable_recv(conn):
+    data = b''
+    while True:
+        part = conn.recv(1024)
+        data += part
+        if len(part) < 1024:
+            break
+    return data.decode()
+
 
 def handle_player(conn, addr, player_id):
     print(f"[NEW CONNECTION] {addr} connected.")
     players.append(conn)
 
-    rsa_public_key_encoded, sig_type = conn.recv(1024).decode().split("|")
-    if sig_type == "DSA":
-        rsa_public_key = DSA.import_key(base64.b64decode(rsa_public_key_encoded))
-    else:
-        rsa_public_key = RSA.import_key(base64.b64decode(rsa_public_key_encoded))
-    public_keys[player_id] = rsa_public_key
-    signature_types[player_id] = sig_type
+    try:
+        data = reliable_recv(conn)
+        print(f"[DEBUG] Received data: {data}")
+        public_key_encoded, sig_type = data.split("|")
 
-    cipher_rsa = PKCS1_OAEP.new(rsa_public_key)
-    session_key = get_random_bytes(16)
-    session_keys[player_id] = session_key
-    encrypted_session_key = cipher_rsa.encrypt(session_key)
-    conn.send(base64.b64encode(encrypted_session_key))
+        if sig_type == "DSA":
+            public_key = DSA.import_key(public_key_encoded.encode())
+        else:
+            public_key = RSA.import_key(public_key_encoded.encode())
 
-    connected = True
-    while connected:
+        print(f"[DEBUG] Public key: {public_key}")
+        print(f"[DEBUG] Signature type: {sig_type}")
+
+        public_keys[player_id] = public_key
+        signature_types[player_id] = sig_type
+
+        if sig_type == "RSA":
+            cipher_rsa = PKCS1_OAEP.new(public_keys[player_id])
+            session_key = get_random_bytes(16)
+            session_keys[player_id] = session_key
+            encrypted_session_key = cipher_rsa.encrypt(session_key)
+            conn.send(base64.b64encode(encrypted_session_key))
+        else:
+            session_key = get_random_bytes(16)
+            session_keys[player_id] = session_key
+            conn.send(base64.b64encode(session_key))
+
         if player_id not in player_numbers:
             numbers = generate_unique_numbers()
             player_numbers[player_id] = numbers
-            conn.send(encrypt(f"Your numbers: {numbers}", session_key))
+            encrypted_message = encrypt(f"Your numbers: {numbers}", session_key)
+            print(f"[DEBUG] Sending numbers to player {player_id}: {numbers}")
+            print(f"[DEBUG] Encrypted message length: {len(encrypted_message)}")
+            conn.send(encrypted_message)
 
-        msg_length = conn.recv(1024).decode('utf-8')
-        if msg_length:
-            msg_length = int(msg_length.strip())
-            encrypted_msg = conn.recv(msg_length)
-            signature = conn.recv(1024)
-            msg = decrypt(encrypted_msg, session_key)
-            if verify_signature(msg, signature, public_keys[player_id], signature_types[player_id]):
-                if msg == END_MESSAGE:
-                    connected = False
-                    print(f"[DISCONNECTED] {addr} disconnected.")
-                    other_player_id = 1 if player_id == 2 else 2
-                    announce_game_winner(player_id, other_player_id)
-                    break
-                elif msg.isdigit() and int(msg) in player_numbers[player_id] and int(msg) not in player_choices[player_id]:
-                    print(f"[Player {player_id} played] {msg}")
-                    with lock:
-                        player_choices[player_id].append(int(msg))
-                    conn.send(encrypt('Choice received', session_key))
-                    if wait_for_moves():
+        while True:
+            try:
+                msg_length = conn.recv(1024).decode('utf-8').strip()
+                if msg_length:
+                    msg_length = int(msg_length)
+                    encrypted_msg = conn.recv(msg_length)
+                    signature = conn.recv(1024)
+                    msg = decrypt(encrypted_msg, session_key)
+                    if verify_signature(msg, signature, public_keys[player_id], signature_types[player_id]):
+                        if msg == END_MESSAGE:
+                            print(f"[DISCONNECTED] {addr} disconnected.")
+                            other_player_id = 1 if player_id == 2 else 2
+                            announce_game_winner(player_id, other_player_id)
+                            break
+                        elif msg.isdigit() and int(msg) in player_numbers[player_id] and int(msg) not in player_choices[
+                            player_id]:
+                            print(f"[Player {player_id} played] {msg}")
+                            with lock:
+                                player_choices[player_id].append(int(msg))
+                            conn.send(encrypt('Choice received', session_key))
+                            if wait_for_moves():
+                                break
+                        else:
+                            conn.send(encrypt('Invalid choice or number already used', session_key))
+                    else:
+                        print(f"[ERROR] Invalid signature from player {player_id}")
+                        conn.send(encrypt('Invalid signature', session_key))
                         break
-                else:
-                    conn.send(encrypt('Invalid choice or number already used', session_key))
-            else:
-                print(f"[ERROR] Invalid signature from player {player_id}")
-                conn.send(encrypt('Invalid signature', session_key))
-                connected = False
+            except Exception as e:
+                print(f"[ERROR] Exception in handle_player: {e}")
+                break
+    except Exception as e:
+        print(f"[ERROR] Initial connection handling failed: {e}")
+    finally:
+        conn.close()
+        print(f"[CLOSED CONNECTION] {addr} connection closed.")
 
-    conn.close()
 
 def announce_round_winner():
     choice1 = player_choices[1][-1]
@@ -96,7 +131,10 @@ def announce_round_winner():
         round_wins[2] += 1
 
     for player_id, player in enumerate(players, 1):
-        player.send(encrypt(f"Round results: Player 1 chose {choice1}, Player 2 chose {choice2}", session_keys[player_id]))
+        if player.fileno() != -1:  # Check if the socket is still open
+            player.send(
+                encrypt(f"Round results: Player 1 chose {choice1}, Player 2 chose {choice2}", session_keys[player_id]))
+
 
 def wait_for_moves():
     with lock:
@@ -107,6 +145,7 @@ def wait_for_moves():
                 return True
             return False
         return True
+
 
 def announce_game_winner(disconnected_player_id, other_player_id):
     if disconnected_player_id:
@@ -120,7 +159,7 @@ def announce_game_winner(disconnected_player_id, other_player_id):
             game_winner = "The game is a draw!"
 
     for player_id, player in enumerate(players, 1):
-        if player_id in session_keys:
+        if player.fileno() != -1:  # Check if the socket is still open
             player.send(encrypt(game_winner, session_keys[player_id]))
 
     for player in players:
@@ -136,10 +175,14 @@ def announce_game_winner(disconnected_player_id, other_player_id):
     round_wins[1] = 0
     round_wins[2] = 0
 
+
 def encrypt(message, key):
     cipher_aes = AES.new(key, AES.MODE_CBC)
     ct_bytes = cipher_aes.encrypt(pad(message.encode(), AES.block_size))
-    return base64.b64encode(cipher_aes.iv + ct_bytes)
+    encrypted_message = base64.b64encode(cipher_aes.iv + ct_bytes)
+    print(f"[DEBUG] Encrypted message: {encrypted_message}")
+    return encrypted_message
+
 
 def decrypt(encrypted_message, key):
     encrypted_message = base64.b64decode(encrypted_message)
@@ -149,6 +192,7 @@ def decrypt(encrypted_message, key):
     pt = unpad(cipher_aes.decrypt(ct), AES.block_size)
     return pt.decode()
 
+
 def sign_message(message, private_key, sig_type):
     hash = SHA256.new(message.encode())
     if sig_type == "DSA":
@@ -157,6 +201,7 @@ def sign_message(message, private_key, sig_type):
         signer = pkcs1_15.new(private_key)
     signature = signer.sign(hash)
     return base64.b64encode(signature)
+
 
 def verify_signature(message, signature, public_key, sig_type):
     try:
@@ -170,6 +215,7 @@ def verify_signature(message, signature, public_key, sig_type):
     except (ValueError, TypeError):
         return False
 
+
 def signal_handler(sig, frame):
     print('Shutting down server...')
     for player in players:
@@ -177,7 +223,9 @@ def signal_handler(sig, frame):
     server.close()
     sys.exit(0)
 
+
 signal.signal(signal.SIGINT, signal_handler)
+
 
 def start():
     server.listen()
@@ -188,6 +236,7 @@ def start():
         thread = threading.Thread(target=handle_player, args=(conn, addr, player_id))
         thread.start()
         print(f'[PLAYERS CONNECTED] {threading.active_count() - 1}')
+
 
 print("[STARTING] Game server starting...")
 start()

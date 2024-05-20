@@ -5,130 +5,147 @@ from Crypto.Hash import SHA256
 from Crypto.Cipher import PKCS1_OAEP, AES
 from Crypto.Util.Padding import pad, unpad
 import base64
-import tkinter as tk
-from tkinter import simpledialog, messagebox
 import threading
 
 # Connection setup
 PORT = 5051
 SERVER = socket.gethostbyname(socket.gethostname())
 client = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-client.connect((SERVER, PORT))
+try:
+    client.connect((SERVER, PORT))
+except ConnectionRefusedError:
+    print("Unable to connect to the server. Ensure the server is running and try again.")
+    exit()
 
 # Key generation and encoding
-signature_type = simpledialog.askstring("Input", "Choose signature type (RSA/DSA):").strip().upper()
-if signature_type == "DSA":
-    key_pair = DSA.generate(2048)
-    signer = DSS.new(key_pair, 'fips-186-3')
-else:
-    key_pair = RSA.generate(2048)
-    signer = pkcs1_15.new(key_pair)
+signature_type = input("Choose signature type (RSA/DSA): ").strip().upper()
+while signature_type not in ["RSA", "DSA"]:
+    signature_type = input("Invalid choice. Choose signature type (RSA/DSA): ").strip().upper()
 
-public_key = key_pair.publickey().export_key()
-public_key_encoded = base64.b64encode(public_key)
-client.send(f"{public_key_encoded.decode()}|{signature_type}".encode())
+if signature_type == "DSA":
+    dsa_key_pair = DSA.generate(2048)
+    signer = DSS.new(dsa_key_pair, 'fips-186-3')
+    public_key = dsa_key_pair.publickey().export_key()
+else:
+    rsa_key_pair = RSA.generate(2048)
+    signer = pkcs1_15.new(rsa_key_pair)
+    public_key = rsa_key_pair.publickey().export_key()
+
+client.send(f"{public_key.decode()}|{signature_type}".encode())
 
 # Receive and decrypt session key
-encrypted_session_key = base64.b64decode(client.recv(1024))
-cipher_rsa = PKCS1_OAEP.new(key_pair)
-session_key = cipher_rsa.decrypt(encrypted_session_key)
+encrypted_session_key = base64.b64decode(client.recv(4096))
+print("Length of encrypted session key:", len(encrypted_session_key))
+print("Encrypted session key:", encrypted_session_key)
+
+if signature_type == "DSA":
+    session_key = encrypted_session_key
+else:
+    cipher_rsa = PKCS1_OAEP.new(rsa_key_pair)
+    session_key = cipher_rsa.decrypt(encrypted_session_key)
+
+assert len(session_key) == 16, "Session key length must be 16 bytes."
 
 player_numbers = []
 used_numbers = []
 
-def sign_message(message, key_pair, signer):
+def sign_message(message, signer):
     hash = SHA256.new(message.encode())
     signature = signer.sign(hash)
     return base64.b64encode(signature)
 
-def encrypt_and_sign(message, key):
-    cipher_aes = AES.new(key, AES.MODE_CBC)
+def encrypt_and_sign(message, session_key, signer):
+    cipher_aes = AES.new(session_key, AES.MODE_CBC)
     ct_bytes = cipher_aes.encrypt(pad(message.encode(), AES.block_size))
     encrypted_message = base64.b64encode(cipher_aes.iv + ct_bytes)
-    signature = sign_message(message, key_pair, signer)
+    signature = sign_message(message, signer)
     return encrypted_message, signature
 
 def decrypt(encrypted_message, key):
-    encrypted_message = base64.b64decode(encrypted_message)
-    iv = encrypted_message[:AES.block_size]
-    ct = encrypted_message[AES.block_size:]
-    cipher_aes = AES.new(key, AES.MODE_CBC, iv)
-    pt = unpad(cipher_aes.decrypt(ct), AES.block_size)
-    return pt.decode()
+    print("Decrypting...")
+    print("Length of encrypted message:", len(encrypted_message))
+    if len(encrypted_message) == 0:
+        print("Empty encrypted message received.")
+        return None
+    try:
+        encrypted_message = base64.b64decode(encrypted_message)
+        print("Decoded message length:", len(encrypted_message))
+        iv = encrypted_message[:AES.block_size]  # IV should be 16 bytes long
+        if len(iv) != AES.block_size:
+            print("Incorrect IV length:", len(iv))
+            return None
+        print("IV:", iv)
+        ct = encrypted_message[AES.block_size:]
+        print("Ciphertext:", ct)
+        cipher_aes = AES.new(key, AES.MODE_CBC, iv)
+        pt = unpad(cipher_aes.decrypt(ct), AES.block_size)
+        print("Decrypted plaintext:", pt)
+        return pt.decode()
+    except Exception as e:
+        print(f"Decryption error: {e}")
+        return None
+
+def receive_message():
+    while True:
+        try:
+            encrypted_message = client.recv(1024)
+            if not encrypted_message:
+                print("No message received, closing connection.")
+                break
+            message = decrypt(encrypted_message, session_key)
+            if message:
+                if message.startswith("Your numbers:"):
+                    numbers = message.split(": ")[1].strip("[]").split(', ')
+                    player_numbers.extend(map(int, numbers))
+                    print("Your numbers: " + ', '.join(numbers))
+                else:
+                    print(message)
+            else:
+                print("Received empty or invalid message")
+        except Exception as e:
+            print(f"Error: {e}")
+            break
+
+    print("Receiver thread exiting...")
+    client.close()
 
 def send_choice(choice):
     if choice.isdigit() and int(choice) in player_numbers and int(choice) not in used_numbers:
         used_numbers.append(int(choice))
-        encrypted_message, signature = encrypt_and_sign(choice, session_key)
-        choice_len = str(len(encrypted_message)).encode('utf-8')
+        encrypted_message, signature = encrypt_and_sign(choice, session_key, signer)
+        message_length = len(encrypted_message)
+        choice_len = str(message_length).encode('utf-8')
         choice_len += b' ' * (1024 - len(choice_len))
         client.send(choice_len)
         client.send(encrypted_message)
         client.send(signature)
         response = decrypt(client.recv(1024), session_key)
-        update_chat(response)
+        print(response)
     else:
-        messagebox.showerror("Invalid Choice", "Invalid choice or number already used")
+        print("Invalid choice or number already used")
 
 def send_quit():
-    encrypted_message, signature = encrypt_and_sign("quit", session_key)
-    choice_len = str(len(encrypted_message)).encode('utf-8')
+    encrypted_message, signature = encrypt_and_sign("quit", session_key, signer)
+    message_length = len(encrypted_message)
+    choice_len = str(message_length).encode('utf-8')
     choice_len += b' ' * (1024 - len(choice_len))
     client.send(choice_len)
     client.send(encrypted_message)
     client.send(signature)
     client.close()
-    root.destroy()
-
-def receive_message():
-    while True:
-        try:
-            message = decrypt(client.recv(1024), session_key)
-            update_chat(message)
-            if message.startswith("Your numbers:"):
-                global player_numbers
-                player_numbers = list(map(int, message.split(": ")[1].strip('[]').split(', ')))
-        except Exception as e:
-            print(f"Error: {e}")
-            break
-
-def update_chat(message):
-    chat_box.config(state=tk.NORMAL)
-    chat_box.insert(tk.END, message + "\n")
-    chat_box.config(state=tk.DISABLED)
-    chat_box.see(tk.END)
-
-def on_send():
-    choice = entry.get()
-    send_choice(choice)
-    entry.delete(0, 'end')
-
-# Tkinter GUI setup
-root = tk.Tk()
-root.title("Secure Poker Game")
-
-header = tk.Label(root, text="Secure Poker Game", font=("Helvetica", 16, "bold"))
-header.pack(pady=10)
-
-chat_frame = tk.Frame(root)
-chat_frame.pack(padx=10, pady=10, fill=tk.BOTH, expand=True)
-
-chat_box = tk.Text(chat_frame, state=tk.DISABLED, wrap=tk.WORD)
-chat_box.pack(padx=10, pady=10, fill=tk.BOTH, expand=True)
-
-entry_frame = tk.Frame(root)
-entry_frame.pack(pady=5)
-
-entry = tk.Entry(entry_frame, font=("Helvetica", 12))
-entry.grid(row=0, column=0, padx=5)
-
-send_button = tk.Button(entry_frame, text="Send Choice", command=on_send, font=("Helvetica", 12))
-send_button.grid(row=0, column=1, padx=5)
-
-quit_button = tk.Button(root, text="Quit", command=send_quit, font=("Helvetica", 12))
-quit_button.pack(pady=10)
 
 # Start the thread to receive messages
-threading.Thread(target=receive_message, daemon=True).start()
+receiver_thread = threading.Thread(target=receive_message, daemon=True)
+receiver_thread.start()
 
-root.mainloop()
+try:
+    while True:
+        choice = input("Enter your choice (or 'quit' to exit): ").strip()
+        if choice.lower() == 'quit':
+            send_quit()
+            break
+        else:
+            send_choice(choice)
+finally:
+    receiver_thread.join()
+    print("Client exiting...")
